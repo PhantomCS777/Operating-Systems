@@ -1,0 +1,1313 @@
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 320480a8d..0b2265897 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -455,3 +455,6 @@
+ 448	i386	process_mrelease	sys_process_mrelease
+ 449	i386	futex_waitv		sys_futex_waitv
+ 450	i386	set_mempolicy_home_node		sys_set_mempolicy_home_node
++456 i386    register_gang       sys_register_gang
++457 i386    exit_gang       sys_exit_gang
++458 i386    list        sys_list
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608..877acaee2 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -372,7 +372,9 @@
+ 448	common	process_mrelease	sys_process_mrelease
+ 449	common	futex_waitv		sys_futex_waitv
+ 450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
+-
++456 common  register_gang       sys_register_gang
++457 common  exit_gang       sys_exit_gang
++458 common  list        sys_list
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+ # in x32 as compared to native x86_64.  These syscalls have numbers 512-547.
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 3dc582414..12c36158a 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -130,6 +130,7 @@
+ 	*(__stop_sched_class)			\
+ 	*(__dl_sched_class)			\
+ 	*(__rt_sched_class)			\
++	*(__gang_sched_class)			\
+ 	*(__fair_sched_class)			\
+ 	*(__idle_sched_class)			\
+ 	__sched_class_lowest = .;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ffb6eb55c..774e51191 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -543,7 +543,19 @@ struct sched_statistics {
+ #endif
+ #endif /* CONFIG_SCHEDSTATS */
+ } ____cacheline_aligned;
+-
++struct sched_gang_entity
++{
++    int gangid; 
++    int pid; 
++    struct task_struct* p; 
++    int* gang_gov_pid; 
++    bool* gov_exists; 
++    cpumask_t* cpumask; 
++	u64 start_time; 
++	u64 exec_time; 
++	u64 max_exec_time; 
++    struct list_head gang_run_list; 
++};
+ struct sched_entity {
+ 	/* For load-balancing: */
+ 	struct load_weight		load;
+@@ -788,6 +800,7 @@ struct task_struct {
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
+ 	struct sched_dl_entity		dl;
++	struct sched_gang_entity 	sge;
+ 	const struct sched_class	*sched_class;
+ 
+ #ifdef CONFIG_SCHED_CORE
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 3bac0a8ce..f85d70742 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -118,7 +118,7 @@ struct clone_args {
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
+-
++#define SCHED_GANG 7
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+ 
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index 976092b7b..1cd2a5bd1 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -29,6 +29,7 @@ endif
+ # build parallelizes well and finishes roughly at once:
+ #
+ obj-y += core.o
++obj-y += gang.o
+ obj-y += fair.o
+ obj-y += build_policy.o
+ obj-y += build_utility.o
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 535af9fbe..efbf72318 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6852,6 +6852,10 @@ static void __setscheduler_prio(struct task_struct *p, int prio)
+ 		p->sched_class = &dl_sched_class;
+ 	else if (rt_prio(prio))
+ 		p->sched_class = &rt_sched_class;
++	else if (p->policy == SCHED_GANG)
++	{
++		p->sched_class = &gang_sched_class; 
++	}
+ 	else
+ 		p->sched_class = &fair_sched_class;
+ 
+@@ -7614,7 +7618,7 @@ static int __sched_setscheduler(struct task_struct *p,
+ 		__setscheduler_prio(p, newprio);
+ 	}
+ 	__setscheduler_uclamp(p, attr);
+-
++	
+ 	if (queued) {
+ 		/*
+ 		 * We enqueue to tail when the priority of a task is
+@@ -8761,6 +8765,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
+ 		ret = MAX_RT_PRIO-1;
+ 		break;
+ 	case SCHED_DEADLINE:
++	case SCHED_GANG:
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
+@@ -8788,6 +8793,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
+ 		ret = 1;
+ 		break;
+ 	case SCHED_DEADLINE:
++	case SCHED_GANG:
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
+@@ -9635,7 +9641,8 @@ void __init sched_init(void)
+ 
+ 	/* Make sure the linker didn't screw up */
+ 	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
+-	       &fair_sched_class != &rt_sched_class + 1 ||
++	       &fair_sched_class != &gang_sched_class + 1 ||
++		   &gang_sched_class != &rt_sched_class + 1 ||
+ 	       &rt_sched_class   != &dl_sched_class + 1);
+ #ifdef CONFIG_SMP
+ 	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
+@@ -9703,6 +9710,7 @@ void __init sched_init(void)
+ 		init_cfs_rq(&rq->cfs);
+ 		init_rt_rq(&rq->rt);
+ 		init_dl_rq(&rq->dl);
++		init_gang_rq(&rq->gang); 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+ 		rq->tmp_alone_branch = &rq->leaf_cfs_rq_list;
+diff --git a/kernel/sched/gang.c b/kernel/sched/gang.c
+new file mode 100644
+index 000000000..bb6527267
+--- /dev/null
++++ b/kernel/sched/gang.c
+@@ -0,0 +1,1004 @@
++#include "gang.h"
++
++static LIST_HEAD(sentinal_gangs_head) ; 
++static unsigned long gll_size=0;
++static DEFINE_SPINLOCK(sentinal_lock); 
++
++// #define DISABLE_LOCKS 
++#ifdef DISABLE_LOCKS
++
++
++#define spin_lock(lock)          do { } while(0)
++#define spin_unlock(lock)        do { } while(0)
++#define spin_lock_irqsave(sentinal_lock, flags)   do { } while(0)
++#define spin_unlock_irqrestore(sentinal_lock, flags) do { } while(0)
++#endif
++// static int cur_running_gang=-1; 
++
++int __check_ncore(struct gang_node* gang_node,int online_cpus){
++    if(!gang_node)
++    {
++        printk("check_ncore: oh no gang_node doesnt exist\n");
++        return -22; 
++    }
++    if(gang_node->num_th > online_cpus)
++    {
++        return -22; 
++    }
++    return 0; 
++}
++
++int __update_pid_list(struct gang_node* gang_node,int pid,u64 exec_time)
++{
++    struct pid_node* pid_node; 
++    struct pid_node* tmp; 
++    int done = 0 ; 
++    list_for_each_entry_safe(pid_node,tmp,&gang_node->sentinal_pid_node,pid_node_list)
++    {
++        if(pid_node->pid == pid)
++        {
++            done = 1 ; 
++            break ; 
++        }
++    }
++    if(!done)
++    {
++        pid_node = kmalloc(sizeof(*pid_node),GFP_KERNEL); 
++        pid_node->pid = pid ;  
++        pid_node->exec_time = exec_time;
++        list_add_tail(&pid_node->pid_node_list,&gang_node->sentinal_pid_node); 
++        gang_node->num_th++; 
++        done = 1 ; 
++    }
++    if(!done) return -22; 
++    return 0; 
++}
++SYSCALL_DEFINE3(register_gang,pid_t,pid,int,gangid,int,exec_time)
++{
++    struct gang_node* gang_node; 
++    struct gang_node* tmp; 
++    // struct sched_gang_entity* sge; 
++    bool done = 0; 
++    struct task_struct *p; 
++    struct sched_param param;  
++    int set_res; 
++    unsigned long flags;
++    cpumask_t cpumask; 
++    int online_cpus = num_online_cpus();
++    // printk(KERN_INFO "Number of online CPUs: %d\n", online_cpus);
++    if(pid < 0) return -3; 
++    p = pid_task(find_get_pid(pid),PIDTYPE_PID); 
++    if(p==NULL || !pid_alive(p))
++    {
++        return -3; 
++    }
++    spin_lock_irqsave(&sentinal_lock,flags); 
++    list_for_each_entry_safe(gang_node,tmp,&sentinal_gangs_head,gang_node_list)
++    {
++        if(gang_node->gangid == gangid)
++        {
++            done = true ; 
++            __update_pid_list(gang_node,pid,((u64)exec_time)*1000000000ULL); 
++            break ; 
++        }
++    }
++    if(!done)
++    {
++        gang_node = kmalloc(sizeof(*gang_node),GFP_KERNEL); 
++        gang_node->gangid = gangid; 
++        gang_node->num_th = 0; 
++        gang_node->exec_time = ((u64)exec_time)*1000000000ULL; 
++        // printk("exec time after casting %llu\n",gang_node->exec_time); 
++        cpumask_clear(&gang_node->cpumask);
++        INIT_LIST_HEAD(&gang_node->sentinal_pid_node);
++        list_add_tail(&gang_node->gang_node_list,&sentinal_gangs_head); 
++        gll_size++; 
++        gang_node->gov_exists = 1; 
++        done = 1 ; 
++        __update_pid_list(gang_node,pid,((u64)exec_time)*1000000000ULL); 
++        cpumask_clear(&gang_node->gg_cpumask); 
++        cpumask_or(&gang_node->gg_cpumask, &gang_node->gg_cpumask, &p->cpus_mask);
++        gang_node->gang_gov_pid = pid ; 
++        
++        // printk("gang gov is %d, with mask: %*pbl\n",pid,cpumask_pr_args(&gang_node->gg_cpumask)); 
++    }
++    
++    if(__check_ncore(gang_node,online_cpus)!=0)
++    {
++
++        __exit_gang(pid,true); 
++        spin_unlock_irqrestore(&sentinal_lock,flags); 
++        return -22; 
++    } 
++
++    cpumask = p->cpus_mask; 
++    cpumask_or(&gang_node->cpumask, &gang_node->cpumask, &cpumask);
++    // sge = &(p->sge); 
++    // if(!gang_node)
++    // {
++    //     printk("HO NO how possible\n"); 
++    //     printk("HO NO how possible\n"); 
++    //     printk("HO NO how possible\n"); 
++    // }
++    // // sge->pid = pid ; 
++    // sge->p = p; 
++    // printk("register reached here pid: %d\n",pid); 
++    // sge->gangid = gang_node->gangid; 
++    // sge->gang_gov_pid = &gang_node->gang_gov_pid; 
++    // // cpumask_clear(&sge->cpumask); 
++    // // cpumask_or(&sge->cpumask,&sge->cpumask,&gang_node->cpumask);
++    // sge->cpumask = &gang_node->cpumask; 
++    // sge->gov_exists = &gang_node->gov_exists ; 
++    
++    spin_unlock_irqrestore(&sentinal_lock,flags); 
++    param.sched_priority = 0; 
++    // printk("pid: %d, cpumask: %*dbl\n", p->pid, cpumask_pr_args(&gang_node->cpumask));
++    set_res = sched_setscheduler_nocheck(p, SCHED_GANG,&param); 
++    if(set_res < 0)
++    {
++        printk("error in reg during setsched with code, %d\n",set_res); 
++    }
++
++    return 0; 
++}
++
++int __find_pid_node(struct gang_node** gang_node,struct pid_node** pid_node,pid_t pid){
++    struct gang_node* tmp; 
++    struct pid_node* temp;  
++    struct gang_node* gang_itr;
++    struct pid_node* pid_itr;
++    if(pid < 0) return -22; 
++    list_for_each_entry_safe(gang_itr,tmp,&sentinal_gangs_head,gang_node_list)
++    {
++        list_for_each_entry_safe(pid_itr,temp,&gang_itr->sentinal_pid_node,pid_node_list)
++        {
++            if(pid_itr->pid == pid)
++            {
++                *gang_node = gang_itr;
++                *pid_node = pid_itr;
++                return 0; 
++            }
++        }
++    }
++    return -22; 
++}
++static inline int __rt_effective_prio(struct task_struct *pi_task, int prio)
++{
++	if (pi_task)
++		prio = min(prio, pi_task->prio);
++
++	return prio;
++}
++static inline int __normal_prio(int policy, int rt_prio, int nice)
++{
++	int prio;
++
++	// if (dl_policy(policy))
++	// 	prio = MAX_DL_PRIO - 1;
++	// else if (rt_policy(policy))
++	// 	prio = MAX_RT_PRIO - 1 - rt_prio;
++	// else
++		prio = NICE_TO_PRIO(nice);
++
++	return prio;
++}
++static inline int normal_prio(struct task_struct *p)
++{
++	return __normal_prio(p->policy, p->rt_priority, PRIO_TO_NICE(p->static_prio));
++}
++
++static inline int rt_effective_prio(struct task_struct *p, int prio)
++{
++	struct task_struct *pi_task = rt_mutex_get_top_task(p);
++
++	return __rt_effective_prio(pi_task, prio);
++}
++static void __setscheduler_params(struct task_struct *p,
++    const struct sched_attr *attr)
++{
++int policy = attr->sched_policy;
++
++if (policy == -1)
++    policy = p->policy;
++
++p->policy = policy;
++
++// if (dl_policy(policy))
++//     __setparam_dl(p, attr);
++// else if (fair_policy(policy))
++    p->static_prio = NICE_TO_PRIO(attr->sched_nice);
++
++/*
++ * __sched_setscheduler() ensures attr->sched_priority == 0 when
++ * !rt_policy. Always setting this ensures that things like
++ * getparam()/getattr() don't report silly values for !rt tasks.
++ */
++p->rt_priority = attr->sched_priority;
++p->normal_prio = normal_prio(p);
++// set_load_weight(p, true);
++}
++static void __setscheduler_prio(struct task_struct *p, int prio)
++{
++	// if (dl_prio(prio))
++	// 	p->sched_class = &dl_sched_class;
++	// else if (rt_prio(prio))
++	// 	p->sched_class = &rt_sched_class;
++	// else
++		p->sched_class = &fair_sched_class;
++
++	p->prio = prio;
++}
++static inline void set_next_task_wrap(struct rq *rq, struct task_struct *next)
++{
++	next->sched_class->set_next_task(rq, next, false);
++}
++static inline void check_class_changed(struct rq *rq, struct task_struct *p,
++    const struct sched_class *prev_class,
++    int oldprio)
++{
++if (prev_class != p->sched_class) {
++if (prev_class->switched_from)
++prev_class->switched_from(rq, p);
++
++p->sched_class->switched_to(rq, p);
++} else if (oldprio != p->prio || dl_task(p))
++p->sched_class->prio_changed(rq, p, oldprio);
++}
++static int cust_sched_setscheduler(struct task_struct *p, int policy, const struct sched_param *param,const struct sched_attr *attr,
++    bool user, bool pi,struct rq* rq)
++{
++    int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
++    int running ; 
++    int queued; 
++    const struct sched_class* prev_class; 
++	int oldprio = p->prio;
++    int reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK);
++    int newprio; 
++	newprio = __normal_prio(policy, attr->sched_priority, attr->sched_nice);
++    p->sched_reset_on_fork = reset_on_fork;
++	if (pi) {
++		/*
++		 * Take priority boosted tasks into account. If the new
++		 * effective priority is unchanged, we just store the new
++		 * normal parameters and do not touch the scheduler class and
++		 * the runqueue. This will be done when the task deboost
++		 * itself.
++		 */
++		newprio = rt_effective_prio(p, newprio);
++		if (newprio == oldprio)
++			queue_flags &= ~DEQUEUE_MOVE;
++	}
++
++	queued = task_on_rq_queued(p);
++	running = task_current(rq, p);
++	if (queued)
++		// dequeue_task(rq, p, queue_flags);
++        p->sched_class->dequeue_task(rq, p, queue_flags);
++	if (running)
++		put_prev_task(rq, p);
++
++	prev_class = p->sched_class;
++
++	if (!(attr->sched_flags & SCHED_FLAG_KEEP_PARAMS)) {
++		__setscheduler_params(p, attr);
++		__setscheduler_prio(p, newprio);
++	}
++	// __setscheduler_uclamp(p, attr);
++
++	if (queued) {
++		/*
++		 * We enqueue to tail when the priority of a task is
++		 * increased (user space view).
++		 */
++		if (oldprio < p->prio)
++			queue_flags |= ENQUEUE_HEAD;
++
++		// enqueue_task(rq, p, queue_flags);
++        p->sched_class->enqueue_task(rq, p, queue_flags);
++	}
++	if (running)
++		set_next_task_wrap(rq, p);
++
++	check_class_changed(rq, p, prev_class, oldprio);
++    return 0 ; 
++}
++
++
++
++int __exit_gang(pid_t pid,bool called_from_do_exit){
++    struct gang_node* gang_node; 
++    struct pid_node* pid_node;
++    struct task_struct *p; 
++    struct sched_param param; 
++    int set_res; 
++    int res ; 
++    int gang_res; 
++    unsigned long flags; 
++    // printk("PID %d, called for exiting with gang gov pid %d\n",pid,gang_node->gang_gov_pid); 
++    spin_lock_irqsave(&sentinal_lock,flags); 
++    res = __find_pid_node(&gang_node,&pid_node,pid); 
++    if(res!=0)
++    {
++        spin_unlock_irqrestore(&sentinal_lock,flags); 
++        return -22; 
++    }
++    if(pid == gang_node->gang_gov_pid && gang_node->num_th >1)
++    {
++        gang_node->gov_exists = 0; 
++    }
++    list_del(&pid_node->pid_node_list); 
++    kfree(pid_node); 
++    gang_node->num_th--; 
++    if(gang_node->num_th==0)
++    gang_res = __dereg_gang_node(gang_node); 
++     
++    if(!called_from_do_exit)   
++    {
++        p = pid_task(find_get_pid(pid),PIDTYPE_PID); 
++        if(p==NULL || !pid_alive(p))
++        {
++            return -4;
++        }
++        param.sched_priority = 0 ; 
++
++        set_res = sched_setscheduler(p,SCHED_NORMAL,&param);
++        if(set_res!=0)
++        {
++            spin_unlock_irqrestore(&sentinal_lock,flags);
++            printk("current sched class: %d, and prio %d\n",p->policy,p->prio); 
++            return 0 ; 
++        }
++    } 
++    spin_unlock_irqrestore(&sentinal_lock,flags);
++    return 0 ; 
++   
++}
++int __dereg_gang_node(struct gang_node* gang_node){
++    if(gang_node->num_th != 0)
++    {
++        return -22; 
++    }
++    list_del(&gang_node->gang_node_list); 
++    kfree(gang_node); 
++    gll_size--; 
++    // cur_running_gang = -1 ;  
++    return 0; 
++}
++SYSCALL_DEFINE1(exit_gang,int,pid)
++{
++   
++    int res; 
++   
++    res = __exit_gang(pid,false); 
++    
++    return res; 
++  
++}
++
++int __get_pid_ll(struct gang_node* gang_node,int* head){
++ 
++    int k_size = 0 ; 
++    struct pid_node* pid_node; 
++    struct pid_node* tmp; 
++    list_for_each_entry_safe(pid_node,tmp,&gang_node->sentinal_pid_node,pid_node_list)
++    {
++        head[k_size++] = pid_node->pid ; 
++    }
++    return  0 ; 
++}
++
++SYSCALL_DEFINE2(list,int,gangid,int*,pids)
++{
++    struct gang_node* gang_node; 
++    struct gang_node* tmp; 
++    int* head; 
++    bool exist = 0 ; 
++    unsigned long flags; 
++    spin_lock_irqsave(&sentinal_lock,flags); 
++    list_for_each_entry_safe(gang_node,tmp,&sentinal_gangs_head,gang_node_list)
++    {
++        if(gang_node->gangid == gangid)
++        {
++            exist = 1; 
++            break ; 
++        }
++    }
++    if(!exist) return -22; 
++    if(gang_node->num_th == 0) return 0 ; 
++    
++    head = kmalloc(gang_node->num_th*(sizeof(int)),GFP_KERNEL); 
++    __get_pid_ll(gang_node,head); 
++    if(copy_to_user(pids,head,gang_node->num_th*(sizeof(int)))==0)
++    {
++        kfree(head); 
++        spin_unlock_irqrestore(&sentinal_lock,flags);
++        return 0 ; 
++    }
++    kfree(head); 
++    spin_unlock_irqrestore(&sentinal_lock,flags); 
++    return -22; 
++}
++
++// struct gang_rq 
++// {
++
++// }; 
++
++void init_gang_rq(struct gang_rq* gang_rq)
++{
++    gang_rq->rqll_size =0 ; 
++    gang_rq->cur_entity_index = -1; 
++    gang_rq->cur_running_gang = -1 ; 
++    INIT_LIST_HEAD(&gang_rq->sentinal_grq_head); 
++}
++static void 
++enqueue_task_gang(struct rq* rq,struct task_struct* p,int flags)
++{
++    struct sched_gang_entity* sge; 
++    struct gang_rq *gang_rq ; 
++    struct gang_node* gang_node; 
++    struct pid_node* pid_node; 
++    pid_t pid; 
++    int find_res; 
++    unsigned long flags2; 
++    gang_rq = &rq->gang;
++    pid = p->pid ; 
++    // printk("enq called for pid %d\n",pid); 
++    spin_lock_irqsave(&sentinal_lock,flags2); 
++    find_res = __find_pid_node(&gang_node,&pid_node,pid); 
++    spin_unlock_irqrestore(&sentinal_lock,flags2); 
++    // sge = kmalloc(sizeof(*sge),GFP_KERNEL); 
++    // if(!p)
++    // {
++    //     printk("OHHH MY GOD pid: %d\n",pid);
++    // }
++    // if(!gang_node)
++    // {
++    //     printk("OHHH MY GOD gang node, pid: %d\n",pid);
++    // }
++    // if(!p || !pid_alive(p)) return; 
++    if(find_res !=0 ) 
++    {
++        printk("oh no enq pid: %d\n",pid); 
++        return ; 
++        
++    }
++    sge = &(p->sge); 
++    sge->gangid = gang_node->gangid; 
++    sge->pid = pid ; 
++    sge->p = p; 
++    sge->gang_gov_pid = &gang_node->gang_gov_pid; 
++    sge->max_exec_time = pid_node->exec_time; 
++    // cpumask_clear(&sge->cpumask); 
++    // cpumask_or(&sge->cpumask,&sge->cpumask,&gang_node->cpumask);
++    sge->cpumask = &gang_node->cpumask; 
++    sge->gov_exists = &gang_node->gov_exists ; 
++    list_add_tail(&sge->gang_run_list,&gang_rq->sentinal_grq_head); 
++    gang_rq->rqll_size++; 
++    // gang_rq->sentinal_grq_head ; 
++    
++}
++
++static void 
++dequeue_task_gang(struct rq* rq,struct task_struct* p,int flags)
++{
++    struct sched_gang_entity* sge; 
++    struct sched_gang_entity* tmp;
++    struct gang_rq *gang_rq ; 
++    pid_t pid; 
++    bool exists = 0 ; 
++    gang_rq = &rq->gang;
++    pid = p->pid ; 
++    // printk("deq called\n"); 
++    list_for_each_entry_safe(sge,tmp,&gang_rq->sentinal_grq_head,gang_run_list)
++    {
++        if(sge->pid == pid)
++        {
++            exists = 1 ; 
++            break ; 
++        }
++    }
++    if(!exists)
++    {
++        printk("not exists in deq pid: %d\n",p->pid); 
++        return ; 
++    }
++    list_del(&sge->gang_run_list); 
++    // kfree(sge); 
++    gang_rq->rqll_size--; 
++    if(gang_rq->rqll_size == 0)
++    {
++        gang_rq->cur_entity_index = -1 ;  
++        gang_rq->cur_running_gang = -1 ; 
++    }
++   
++}
++
++static void 
++yield_task_gang(struct rq* rq)
++{
++    ; 
++}
++
++static void 
++check_preempt_curr_gang(struct rq* rq,struct task_struct* p,int flags)
++{
++    ; 
++}
++static inline bool _check_gov_alive(pid_t gang_gov_pid)
++{
++    // if (!gang_gov_pid)
++    //     {
++
++    //         printk("check gov was called with 0 pid\n"); 
++    //         return false;
++
++    //     }
++    struct task_struct* gov_p =  pid_task(find_get_pid(gang_gov_pid),PIDTYPE_PID); 
++    if(gov_p==NULL || !pid_alive(gov_p))
++    {
++        return 0; 
++    }
++    return task_is_running(gov_p);
++}
++
++inline void __assign_new_gov(int gangid)
++{
++    struct gang_node* gang_node; 
++    struct gang_node* tmp; 
++    struct pid_node* pid_node; 
++    bool exists = 0; 
++    unsigned long flags; 
++    spin_lock_irqsave(&sentinal_lock,flags); 
++    list_for_each_entry_safe(gang_node,tmp,&sentinal_gangs_head,gang_node_list)
++    {
++        if(gang_node->gangid == gangid)
++        {
++            exists= 1; 
++            break; 
++        }
++    }
++    if(!exists)
++    {
++        spin_unlock_irqrestore(&sentinal_lock,flags); 
++        return; 
++    }
++    pid_node = list_first_entry(&gang_node->sentinal_pid_node,struct pid_node,pid_node_list); 
++    gang_node->gang_gov_pid = pid_node->pid; 
++    gang_node->gov_exists = 1; 
++    // gang_node->cpumask = and(gang_node->cpumask,~ gang_node->gg_cpumask); 
++    cpumask_andnot(&gang_node->cpumask, &gang_node->cpumask, &gang_node->gg_cpumask);
++    gang_node->gg_cpumask = pid_node->cpumask; 
++    spin_unlock_irqrestore(&sentinal_lock,flags); 
++
++}
++void __governer(struct rq* rq)
++{
++
++    struct sched_gang_entity* sge; 
++    struct sched_gang_entity* tmp; 
++    struct gang_rq *gang_rq ;
++    
++    int cpu; 
++    int index=0;
++    // bool done = 0; 
++    if(!rq)
++    {
++        return; 
++    }
++    gang_rq = &rq->gang;
++
++    if(gang_rq->rqll_size==0)
++    {
++        return; 
++    }
++
++ 
++    /*
++        // Assuming no mixed kinds of threads, that is the rq either has threads from gangs that are all governer or non-governer only  
++        In otherwise scenario, 
++        // __balance_gangs() 
++        such a routine can be called which will try migrate the rq_entities to free cores or atleast ensure homogenity so that assumption holds.  
++    */
++    sge= list_first_entry(&gang_rq->sentinal_grq_head,struct sched_gang_entity,gang_run_list); 
++
++    if(sge->pid != *(sge->gang_gov_pid))
++             return ;
++    
++    // printk("here \n");
++    if(gang_rq->cur_entity_index == -1) 
++    {
++        gang_rq->cur_entity_index = 0 ; 
++    }
++    if(gang_rq->rqll_size == 1)
++    {
++        gang_rq->cur_entity_index = 0 ; 
++        // cur_running_gang = sge->gangid; 
++        gang_rq->cur_running_gang = sge->gangid;   
++        // call IPI of the gov 
++        // printk("sbout to send IPI"); 
++        // smp_send_reschedule(&sge->cpumask);
++        // smp_call_function_many(&sge->cpumask, resched_callback, NULL, 0);
++
++        for_each_cpu(cpu,sge->cpumask) {
++            // send_IPI(cpu, RESCHEDULE_VECTOR);
++            // printk("this is cpu %d\n",cpu);
++            smp_send_reschedule(cpu); 
++        }
++        return ; 
++    }
++
++    sge=NULL; 
++    list_for_each_entry_safe(sge,tmp,&gang_rq->sentinal_grq_head,gang_run_list)
++    {
++        if(gang_rq->cur_entity_index == index)
++        {
++            // call IPI of this gov 
++            // cur_running_gang = sge->gangid; 
++            gang_rq->cur_running_gang = sge->gangid ; 
++            gang_rq->cur_entity_index = (gang_rq->cur_entity_index +1)%(gang_rq->rqll_size); 
++            // smp_call_function_many(&sge->cpumask, resched_callback, NULL, 0);
++            // smp_send_reschedule(&sge->cpumask);
++            for_each_cpu(cpu,sge->cpumask) {
++                // send_IPI(cpu, RESCHEDULE_VECTOR);
++                smp_send_reschedule(cpu); 
++            }
++            return; 
++        }
++        index++; 
++    }
++    // rqll size is not zero and no one got selected from above to send IPI,
++    // safety check therefore:- 
++    gang_rq->cur_entity_index = 0;
++    __governer(rq);               
++}
++
++static struct task_struct *
++pick_next_task_gang(struct rq* rq)
++{
++    // printk("pick_task_gang_next called\n"); 
++    struct sched_gang_entity* sge; 
++    struct sched_gang_entity* tmp; 
++    int index = 0; 
++    u64 now = rq_clock_task(rq); 
++    struct gang_rq *gang_rq ; 
++    if(!rq)
++    {
++        return NULL; 
++    }
++    gang_rq = &rq->gang;
++
++    if(gang_rq->rqll_size==0)
++    {
++        return NULL; 
++    }
++
++    // sge= list_first_entry(&gang_rq->sentinal_grq_head,struct sched_gang_entity,gang_run_list); 
++    // if(!sge) return NULL; 
++    // printk("pid is %d\n",sge->pid); 
++    // return sge->p; 
++    if(gang_rq->cur_entity_index == -1 && gang_rq->rqll_size!=0)
++    {
++        gang_rq->cur_entity_index = 0 ; 
++    }
++    // if(cur_running_gang == -1)
++    // {
++    //       sge= list_first_entry(&gang_rq->sentinal_grq_head,struct sched_gang_entity,gang_run_list); 
++    //       if(!sge) return NULL; 
++    //       if(!_check_gov_alive(sge)) return NULL ; 
++    //       cur_running_gang= sge->gangid ; 
++    //       return sge->p; 
++    // }
++
++
++    list_for_each_entry_safe(sge,tmp,&gang_rq->sentinal_grq_head,gang_run_list)
++    {
++        if(*(sge->gang_gov_pid) == sge->pid)
++        {
++            // If I am governer's core 
++            if(gang_rq->cur_running_gang == sge->gangid)
++            {
++                sge->start_time = now; 
++                return sge->p ; 
++            }
++            if(!_check_gov_alive(gang_rq->cur_running_gang)) // if gov gone to sleep preempt to next gang in middle of quanta 
++            {
++                // printk("prempting to next gang\n"); 
++                __governer(rq); 
++            }
++
++        }
++
++        if(_check_gov_alive(*(sge->gang_gov_pid))) // if this process's gov alive 
++        {
++            if(gang_rq->rqll_size == 1)
++            { 
++                sge->start_time = now; 
++                return sge->p; 
++            }// if the only process on this core just run 
++            sge->start_time = now; 
++                return sge->p; 
++            
++            // // else do Round robin 
++            // if(index == gang_rq->cur_entity_index)
++            // {
++            //     gang_rq->cur_entity_index = (gang_rq->cur_entity_index+1)%gang_rq->rqll_size ; 
++            //     sge->start_time = now; 
++            //     return sge->p ; 
++            // }
++            // index++; 
++        }
++        if(!_check_gov_alive(*(sge->gang_gov_pid)) && !(*(sge->gov_exists)))
++        {
++            __assign_new_gov(sge->gangid); 
++        }
++        // if(sge->gangid == cur_running_gang)
++        // {
++        //     if(!_check_gov_alive(sge)) return NULL ; 
++        //     return sge->p; 
++        // }
++    }
++    return NULL; 
++}
++
++static void _check_time_exceed(struct task_struct* p,struct rq* rq)
++{
++    
++    struct sched_param param; 
++    int policy ; 
++    // unsigned long flags; 
++    struct sched_attr attr = {
++        .sched_policy   = SCHED_NORMAL,
++		// .sched_priority = (&param)->sched_priority,
++        .sched_priority = 0, 
++		.sched_nice	= PRIO_TO_NICE((p)->static_prio),
++	};
++    policy = SCHED_NORMAL; 
++    param.sched_priority = 0 ; 
++
++    if(!rq)
++    {
++        printk("rq does not exits\n"); 
++    }
++   
++    if((p->sge).exec_time > (p->sge).max_exec_time)
++    {
++        // (1000000000ULL)
++        // printk("cur exec_time: %llu, max exec time: %llu\n",sge->exec_time/(1000000000ULL),sge->max_exec_time/(1000000000ULL)); 
++        // printk("time exceeded for pid: %d\n",p->pid); 
++        
++      
++        /* Fixup the legacy SCHED_RESET_ON_FORK hack. */
++        if ((policy != -1) && (policy & SCHED_RESET_ON_FORK)) {
++            attr.sched_flags |= SCHED_FLAG_RESET_ON_FORK;
++            policy &= ~SCHED_RESET_ON_FORK;
++            attr.sched_policy = policy;
++        }
++        
++        __exit_gang(p->pid,true); 
++        // spin_lock_irqsave(&sentinal_lock,flags);
++        cust_sched_setscheduler(p,SCHED_NORMAL,&param,&attr,0,1,rq); 
++        // spin_unlock_irqrestore(&sentinal_lock,flags); 
++
++
++    }
++}
++
++static void __update_exec_time(struct rq* rq,struct task_struct* p)
++{
++    u64 delta; 
++    u64 now = rq_clock_task(rq); 
++    if((p->sge).start_time == 0)
++    {
++        (p->sge).start_time = now; 
++    }
++    delta = now - (p->sge).start_time ; 
++    (p->sge).exec_time += delta; 
++    (p->sge).start_time = now; 
++}
++static void 
++put_prev_task_gang(struct rq* rq, struct task_struct* p)
++{
++    u64 ti; 
++    if(!p || !pid_alive(p)) return ; 
++    if(task_is_running(p))
++    {
++        __update_exec_time(rq,p) ;  
++    }
++    ti = (p->sge).exec_time / 1000000000ULL; 
++    // printk("time so far put_prev task of pid: %d, is %llu \n",p->pid,ti);
++}
++
++static void 
++set_next_task_gang(struct rq *rq, struct task_struct *next,bool first)
++{
++    ; 
++}
++
++static int 
++balance_gang(struct rq* rq,struct task_struct* p,struct rq_flags* rf)
++{
++    return 0; 
++}
++
++static struct task_struct* 
++pick_task_gang(struct rq* rq)
++{
++    // printk("pick_task_gang called\n"); 
++    return NULL; 
++}
++
++static int 
++select_task_rq_gang(struct task_struct* p,int cpu, int flags)
++{
++    // printk("select_task_rq_gang called\n"); 
++    return 0; 
++}
++
++// static void 
++// set_cpus_allowed_common_gang(struct task_struct *p,const struct cpumask* new_mask,u32 flags)
++// {
++//     ; 
++// }
++
++static void 
++rq_online_gang(struct rq* rq)
++{
++    ; 
++}
++
++static void 
++rq_offline_gang(struct rq* rq)
++{
++    ; 
++}
++
++static void 
++task_woken_gang(struct rq* rq,struct task_struct* p)
++{
++    // if(p)
++    // printk("task_woken_gang called for pid %d\n",p->pid); 
++    
++}
++
++
++static struct rq*
++find_lock_rq_gang(struct task_struct *p, struct rq *rq)
++{
++    return NULL; 
++}
++
++
++
++static void 
++task_tick_gang(struct rq* rq,struct task_struct* p,int queued)
++{
++    static DEFINE_PER_CPU(unsigned long, gang_tick_counter);
++    unsigned long *counter = this_cpu_ptr(&gang_tick_counter);
++    unsigned long quanta_ticks = msecs_to_jiffies(QUANTA_MSEC);
++    u64 ti; 
++    if(task_is_running(p))
++    __update_exec_time(rq,p); 
++    // _check_time_exceed(&(p->sge),rq); 
++    _check_time_exceed(p,rq); 
++    // static DEFINE_PER_CPU(int, gov_res); 
++    // if (smp_processor_id() != gang_governor_cpu)
++    //     return;
++
++    (*counter)++;
++
++    if (*counter >= quanta_ticks) {
++        *counter = 0;  // Reset the counter
++        // printk("THE calling core: %d\n",smp_processor_id()); 
++        ti = (p->sge).exec_time / 1000000000ULL; 
++        // printk("time so far of pid %d, is %llu \n",p->pid,ti); 
++        __governer(rq); 
++        // smp_send_reschedule(&gang_target_mask);
++    }
++}
++
++static unsigned int 
++get_rr_interval_gang(struct rq *rq,
++    struct task_struct *task)
++{
++    return 0; 
++}
++
++static void 
++task_fork_gang(struct task_struct* p)
++{
++    // printk("task_fork_gang called \n"); 
++}
++
++static void
++prio_changed_gang(struct rq* rq,struct task_struct* p,int oldprio)
++{
++    // printk("prio_changed_gang called \n"); 
++}
++
++static void 
++switched_to_gang(struct rq* rq,struct task_struct* p)
++{
++    // printk("switched_to_gang called \n"); 
++}
++
++static void 
++switched_from_gang(struct rq* rq,struct task_struct* p)
++{
++    // printk("switched_from_gang called \n"); 
++}
++
++static void
++update_curr_gang(struct rq* rq)
++{
++    // printk("update_curr_gang called \n"); 
++}
++
++static void 
++migrate_task_rq_gang(struct task_struct* p,int new_cpu __maybe_unused)
++{
++    // printk("migrate_task_rq_gang called \n"); 
++}
++
++static bool 	
++yield_to_task_gang(struct rq *rq, struct task_struct *p)
++{
++    return 0; 
++}
++
++static void 
++task_change_group_gang(struct task_struct *p)
++{
++    ; 
++}
++
++static void
++task_dead_gang(struct task_struct* p)
++{
++    ; 
++}
++
++DEFINE_SCHED_CLASS(gang) = {
++
++	.enqueue_task		= enqueue_task_gang,
++	.dequeue_task		= dequeue_task_gang,
++	.yield_task		= yield_task_gang,
++
++	.check_preempt_curr	= check_preempt_curr_gang,
++    
++	.pick_next_task		= pick_next_task_gang,
++	.put_prev_task		= put_prev_task_gang,
++	.set_next_task          = set_next_task_gang,
++    .yield_to_task = yield_to_task_gang, 
++
++#ifdef CONFIG_SMP
++	.balance		= balance_gang,
++	.pick_task		= pick_task_gang,
++	.select_task_rq		= select_task_rq_gang,
++	.set_cpus_allowed       = set_cpus_allowed_common,
++	.rq_online              = rq_online_gang,
++	.rq_offline             = rq_offline_gang,
++	.task_woken		= task_woken_gang,
++    .migrate_task_rq = migrate_task_rq_gang,
++    
++	.find_lock_rq		= find_lock_rq_gang,
++#endif
++
++	.task_tick		= task_tick_gang,
++    .task_fork      = task_fork_gang, 
++    .task_dead      = task_dead_gang,
++	.get_rr_interval	= get_rr_interval_gang,
++
++	.prio_changed		= prio_changed_gang,
++	.switched_to		= switched_to_gang,
++    .switched_from      = switched_from_gang,
++	.update_curr		= update_curr_gang,
++
++#ifdef CONFIG_UCLAMP_TASK
++	.uclamp_enabled		= 1,
++#endif
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	.task_change_group = task_change_group_gang,
++#endif
++};
++
+diff --git a/kernel/sched/gang.h b/kernel/sched/gang.h
+new file mode 100644
+index 000000000..c17c89e36
+--- /dev/null
++++ b/kernel/sched/gang.h
+@@ -0,0 +1,80 @@
++#include <linux/energy_model.h>
++#include <linux/mmap_lock.h>
++#include <linux/hugetlb_inline.h>
++#include <linux/jiffies.h>
++#include <linux/mm_api.h>
++#include <linux/highmem.h>
++#include <linux/spinlock_api.h>
++#include <linux/cpumask_api.h>
++#include <linux/lockdep_api.h>
++#include <linux/softirq.h>
++#include <linux/refcount_api.h>
++#include <linux/topology.h>
++#include <linux/sched/clock.h>
++#include <linux/sched/cond_resched.h>
++#include <linux/sched/cputime.h>
++#include <linux/sched/isolation.h>
++#include <linux/sched/nohz.h>
++
++#include <linux/cpuidle.h>
++#include <linux/interrupt.h>
++#include <linux/memory-tiers.h>
++#include <linux/mempolicy.h>
++#include <linux/mutex_api.h>
++#include <linux/profile.h>
++#include <linux/psi.h>
++#include <linux/ratelimit.h>
++#include <linux/task_work.h>
++
++#include <asm/switch_to.h>
++
++#include <linux/sched/cond_resched.h>
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/cpumask.h>
++
++#include "sched.h"
++#include "stats.h"
++#include "autogroup.h"
++#include <uapi/linux/sched/types.h>
++#define QUANTA_MSEC 100
++struct gang_node
++{
++    int gangid; 
++    int num_th; 
++    u64 exec_time; 
++    int gang_gov_pid; 
++    bool gov_exists; 
++    cpumask_t gg_cpumask; 
++    cpumask_t cpumask; 
++    struct list_head sentinal_pid_node; 
++    struct list_head gang_node_list; 
++};
++
++struct pid_node
++{
++    int pid; 
++    u64 exec_time; 
++    int prio; 
++    cpumask_t cpumask; 
++    struct list_head pid_node_list; 
++}; 
++
++// struct sched_gang_entity
++// {
++//     int gangid; 
++//     int pid; 
++//     struct task_struct* p; 
++//     int* gang_gov_pid; 
++//     bool* gov_exists; 
++//     cpumask_t* cpumask; 
++//     struct list_head gang_run_list; 
++// };
++
++int __check_ncore(struct gang_node* gang_node,int online_cpus); 
++int __update_pid_list(struct gang_node* gang_node,int pid,u64 exec_time); 
++int __find_pid_node(struct gang_node** gang_node,struct pid_node** pid_node,pid_t pid); 
++int __exit_gang(pid_t pid,bool called_from_do_exit); 
++int __dereg_gang_node(struct gang_node* gang_node); 
++int __get_pid_ll(struct gang_node* gang_node,int* head); 
+\ No newline at end of file
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index d6d488e8e..5374b6ac2 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -196,10 +196,15 @@ static inline int dl_policy(int policy)
+ {
+ 	return policy == SCHED_DEADLINE;
+ }
++static inline int gang_policy(int policy)
++{
++	printk("gang_policy called, policy: %d, SCHED_GANG: %d\n",policy,SCHED_GANG); 
++	return policy == SCHED_GANG; 
++}
+ static inline bool valid_policy(int policy)
+ {
+ 	return idle_policy(policy) || fair_policy(policy) ||
+-		rt_policy(policy) || dl_policy(policy);
++		rt_policy(policy) || dl_policy(policy) || gang_policy(policy);
+ }
+ 
+ static inline int task_has_idle_policy(struct task_struct *p)
+@@ -334,6 +339,15 @@ extern int  dl_cpu_busy(int cpu, struct task_struct *p);
+ 
+ #ifdef CONFIG_CGROUP_SCHED
+ 
++struct gang_rq 
++{
++	// LIST_HEAD(sentinal_head);
++	unsigned long rqll_size; 
++	int cur_entity_index; 
++	int cur_running_gang; 
++	struct list_head sentinal_grq_head;  
++
++}; 
+ struct cfs_rq;
+ struct rt_rq;
+ 
+@@ -988,6 +1002,7 @@ struct rq {
+ #endif
+ 
+ 	struct cfs_rq		cfs;
++	struct gang_rq		gang;
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
+ 
+@@ -2248,6 +2263,7 @@ extern struct sched_class __sched_class_lowest[];
+ extern const struct sched_class stop_sched_class;
+ extern const struct sched_class dl_sched_class;
+ extern const struct sched_class rt_sched_class;
++extern const struct sched_class gang_sched_class;
+ extern const struct sched_class fair_sched_class;
+ extern const struct sched_class idle_sched_class;
+ 
+@@ -2762,7 +2778,7 @@ static inline void resched_latency_warn(int cpu, u64 latency) {}
+ extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+ extern void init_rt_rq(struct rt_rq *rt_rq);
+ extern void init_dl_rq(struct dl_rq *dl_rq);
+-
++extern void init_gang_rq(struct gang_rq* gang_rq); 
+ extern void cfs_bandwidth_usage_inc(void);
+ extern void cfs_bandwidth_usage_dec(void);
+ 

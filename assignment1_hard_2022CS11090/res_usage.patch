@@ -1,0 +1,684 @@
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 320480a8d..254135228 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -455,3 +455,8 @@
+ 448	i386	process_mrelease	sys_process_mrelease
+ 449	i386	futex_waitv		sys_futex_waitv
+ 450	i386	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451 i386    register    sys_register
++452 i386    fetch sys_fetch
++453 i386    deregister  sys_deregister
++454 i386    resource_cap    sys_resource_cap
++455 i386    resource_reset  sys_resource_reset
+\ No newline at end of file
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608..ab28e36d3 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -372,7 +372,11 @@
+ 448	common	process_mrelease	sys_process_mrelease
+ 449	common	futex_waitv		sys_futex_waitv
+ 450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
+-
++451 common  register    sys_register
++452 common  fetch sys_fetch
++453 common  deregister  sys_deregister
++454 common  resource_cap    sys_resource_cap
++455 common  resource_reset  sys_resource_reset
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+ # in x32 as compared to native x86_64.  These syscalls have numbers 512-547.
+diff --git a/fs/open.c b/fs/open.c
+index a81319b61..262a8802b 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -35,7 +35,7 @@
+ #include <linux/mnt_idmapping.h>
+ 
+ #include "internal.h"
+-
++#include <linux/tracker_limiter.h> 
+ int do_truncate(struct user_namespace *mnt_userns, struct dentry *dentry,
+ 		loff_t length, unsigned int time_attrs, struct file *filp)
+ {
+@@ -1317,6 +1317,7 @@ static long do_sys_openat2(int dfd, const char __user *filename,
+ 		}
+ 	}
+ 	putname(tmp);
++	monitor_files(1); 
+ 	return fd;
+ }
+ 
+@@ -1444,7 +1445,10 @@ SYSCALL_DEFINE1(close, unsigned int, fd)
+ 		     retval == -ERESTARTNOHAND ||
+ 		     retval == -ERESTART_RESTARTBLOCK))
+ 		retval = -EINTR;
+-
++	if(retval==0)
++	{
++		monitor_files(0); 
++	}
+ 	return retval;
+ }
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ffb6eb55c..7f413cc48 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1527,7 +1527,8 @@ struct task_struct {
+ 	 */
+ 	union rv_task_monitor		rv[RV_PER_TASK_MONITORS];
+ #endif
+-
++	long heapquota; 
++	long filequota;
+ 	/*
+ 	 * New fields for task_struct should be added above here, so that
+ 	 * they are included in the randomized portion of task_struct.
+diff --git a/include/linux/tracker_limiter.h b/include/linux/tracker_limiter.h
+new file mode 100644
+index 000000000..77aa7dab3
+--- /dev/null
++++ b/include/linux/tracker_limiter.h
+@@ -0,0 +1,36 @@
++#ifndef TL_H
++#define TL_H
++#include <linux/kernel.h> 
++#include <linux/syscalls.h> 
++#include <linux/types.h> 
++#include <linux/sched.h> 
++#include <linux/errno.h> 
++#include <linux/list.h> 
++#include <linux/slab.h> 
++#include <linux/mutex.h>
++
++struct per_proc_resource {
++    pid_t pid; /* process id */
++    unsigned long heapsize;  /* Total memory allocated by
++    a process through the brk system call , and the mmap
++    system call when used with the MAP_ANONYMOUS |
++    MAP_PRIVATE flags . */
++    unsigned long openfile_count;  /* Total number of open
++    files of a process using the open , openat , and
++    openat2 system calls */
++    };
++struct pid_node {
++    struct per_proc_resource * proc_resource ; /* Resource
++    utilization of a process */
++    struct list_head next_prev_list ; /* contains pointers
++    to previous and next elements */
++    };
++int __deregister(pid_t pid); 
++int check_if_monitored(struct pid_node** node,pid_t pid); 
++int monitor_brk(unsigned long oldbrk,unsigned long newbrk); 
++int monitor_mmap(unsigned long len); 
++int monitor_files(int open); 
++int quota_check(struct pid_node *iter, struct per_proc_resource *proc_resource, pid_t pid);
++int kill_and_dereg(struct pid_node *iter,struct task_struct *cur_task); 
++// int monitor_vm_munmap(unsigned long len); 
++#endif
+\ No newline at end of file
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 45fa180cc..e3b4943fb 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -42,7 +42,17 @@ __SYSCALL(__NR_io_cancel, sys_io_cancel)
+ #define __NR_io_getevents 4
+ __SC_3264(__NR_io_getevents, sys_io_getevents_time32, sys_io_getevents)
+ #endif
+-
++/* kernel/tracker_limiter.c */
++#define __NR_register 451
++__SYSCALL(__NR_register,sys_register); 
++#define __NR_fetch 452
++__SYSCALL(__NR_fetch,sys_fetch);
++#define __NR_deregister 453
++__SYSCALL(__NR_deregister,sys_deregister);
++#define __NR_resource_cap 454
++__SYSCALL(__NR_resource_cap,sys_resource_cap);
++#define __NR_resource_reset 455
++__SYSCALL(__NR_resource_reset,sys_resource_reset);
+ /* fs/xattr.c */
+ #define __NR_setxattr 5
+ __SYSCALL(__NR_setxattr, sys_setxattr)
+@@ -887,7 +897,7 @@ __SYSCALL(__NR_futex_waitv, sys_futex_waitv)
+ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 451
++#define __NR_syscalls 456
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/Makefile b/kernel/Makefile
+index ebc692242..765f3d15f 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -15,7 +15,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MODULES) += kmod.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+-
++obj-y += tracker_limiter.o
+ ifdef CONFIG_FUNCTION_TRACER
+ # Do not trace internal ftrace files
+ CFLAGS_REMOVE_irq_work.o = $(CC_FLAGS_FTRACE)
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 35e0a31a0..9de1f608d 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -71,7 +71,7 @@
+ #include <linux/uaccess.h>
+ #include <asm/unistd.h>
+ #include <asm/mmu_context.h>
+-
++#include <linux/tracker_limiter.h> 
+ static void __unhash_process(struct task_struct *p, bool group_dead)
+ {
+ 	nr_threads--;
+@@ -774,7 +774,7 @@ void __noreturn do_exit(long code)
+ 
+ 	io_uring_files_cancel();
+ 	exit_signals(tsk);  /* sets PF_EXITING */
+-
++	__deregister(tsk->pid);
+ 	/* sync mm's RSS info before statistics gathering */
+ 	if (tsk->mm)
+ 		sync_mm_rss(tsk->mm);
+diff --git a/kernel/tracker_limiter.c b/kernel/tracker_limiter.c
+new file mode 100644
+index 000000000..3eba9d49f
+--- /dev/null
++++ b/kernel/tracker_limiter.c
+@@ -0,0 +1,456 @@
++#include <linux/tracker_limiter.h> 
++/*
++    ESRCH : 3 
++    EINVAL : 22 
++    ENFILE : 23 
++*/
++static LIST_HEAD(sentinal_head);
++static DEFINE_MUTEX(sentinal_lock); 
++static unsigned long ll_size=0; 
++int quota_check(struct pid_node *iter, struct per_proc_resource *proc_resource, pid_t pid)
++{
++    struct task_struct *cur_task = pid_task(find_get_pid(pid), PIDTYPE_PID);
++    unsigned long heapsize = proc_resource->heapsize; 
++    unsigned long filecount = proc_resource->openfile_count; 
++    if(cur_task == NULL || !pid_alive(cur_task))
++    {
++        // printk("while checking quota pid does not exists %d\n",pid); 
++        return -ESRCH ; 
++    }
++    if((cur_task->heapquota == -1) && (cur_task->filequota==-1))
++        return 0; 
++    if(((cur_task->heapquota!=-1) && (heapsize > cur_task->heapquota))|| ((cur_task->filequota!=-1) && (filecount > cur_task->filequota)))
++    {
++        kill_and_dereg(iter,cur_task); 
++        return -EINVAL; 
++    }
++    return 0; 
++}
++int kill_and_dereg(struct pid_node *iter,struct task_struct *cur_task)
++{
++        int killed = send_sig(SIGKILL,cur_task,1);
++        return killed ; 
++}
++int check_if_monitored(struct pid_node** node,pid_t pid)
++{
++    struct pid_node* iter,*tmp; 
++    if(pid < 1)
++    {
++        return -EINVAL; 
++    }
++    list_for_each_entry_safe(iter,tmp,&sentinal_head,next_prev_list)
++    {
++        // printk("ll nodes pid: %d, asking pid: %d\n",iter->proc_resource->pid,pid); 
++        if(iter->proc_resource->pid == pid)
++        {
++            *node = iter; 
++            
++            // printk("found pid: %d\n",pid); 
++            return 0; 
++        }
++    }
++    return -EINVAL; 
++}
++int monitor_brk(unsigned long oldbrk,unsigned long newbrk)
++{
++    pid_t cur_pid = task_pid_vnr(current); 
++    pid_t cur_tgid = current->tgid ; 
++	struct pid_node* cur_node=NULL;
++    struct pid_node* cur_node_tgid =NULL; 
++    int monitor = -EINVAL; 
++    int monitor_tgid = -EINVAL; 
++    mutex_lock(&sentinal_lock); 
++	monitor = check_if_monitored(&cur_node,cur_pid); 
++    monitor_tgid = check_if_monitored(&cur_node_tgid,cur_tgid); 
++    if(monitor_tgid == 0)
++    {
++        // printk("tgid found brk succ,len :%ld\n",(newbrk-oldbrk)); 
++        if((oldbrk <= newbrk) || (cur_node_tgid)->proc_resource->heapsize >= -(newbrk-oldbrk)/(1024*1024) )
++		    (cur_node_tgid)->proc_resource->heapsize += (newbrk-oldbrk)/(1024*1024); 
++        else
++            cur_node_tgid->proc_resource->heapsize = 0 ; 
++       
++        if(quota_check(cur_node_tgid,cur_node_tgid->proc_resource,cur_tgid)==0 && cur_tgid==cur_pid)
++            {
++                mutex_unlock(&sentinal_lock); 
++                return 0;
++            }
++        if(cur_tgid==cur_pid)
++        {
++        mutex_unlock(&sentinal_lock);
++        return -EINVAL;  
++        }
++    }
++	if(monitor==0)
++	{
++        // printk("brk succ, len: %ld\n",(newbrk-oldbrk)); 
++        if((oldbrk <= newbrk) || (cur_node)->proc_resource->heapsize >= -(newbrk-oldbrk)/(1024*1024) )
++		    (cur_node)->proc_resource->heapsize += (newbrk-oldbrk)/(1024*1024); 
++        else
++            cur_node->proc_resource->heapsize = 0 ; 
++        // int quota = quota_check(cur_node,cur_node->proc_resource,cur_pid); 
++        if(quota_check(cur_node,cur_node->proc_resource,cur_pid)==0)
++            {
++                mutex_unlock(&sentinal_lock); 
++                return 0;
++            }
++        mutex_unlock(&sentinal_lock);
++        return -EINVAL;  
++	}
++    mutex_unlock(&sentinal_lock); 
++    return monitor; 
++}
++int monitor_mmap(unsigned long len)
++{
++    pid_t cur_pid = task_pid_vnr(current); 
++    pid_t cur_tgid = current->tgid ; 
++	struct pid_node* cur_node = NULL; 
++    struct pid_node* cur_node_tgid = NULL; 
++    int monitor = -EINVAL; 
++    int monitor_tgid = -EINVAL; 
++    // printk("inside mmap\n"); 
++    mutex_lock(&sentinal_lock); 
++	monitor= check_if_monitored(&cur_node,cur_pid); 
++    monitor_tgid = check_if_monitored(&cur_node_tgid,cur_tgid); 
++    // printk("tgid, pid: %d,%d,%d,%d\n",cur_tgid,cur_pid,monitor_tgid,monitor); 
++    // if(ll_size) 
++
++    if(monitor_tgid==0)
++    {
++        // printk("tgid found, mmap succ, len: %ld\n",len); 
++		(cur_node_tgid)->proc_resource->heapsize += (len)/(1024*1024); 
++        if(quota_check(cur_node_tgid,cur_node_tgid->proc_resource,cur_tgid)==0 && cur_pid==cur_tgid)
++            {
++                mutex_unlock(&sentinal_lock); 
++                return 0;
++            }
++        if(cur_tgid==cur_pid)
++        {
++        mutex_unlock(&sentinal_lock); 
++        return -EINVAL; 
++        }
++    }
++	if(monitor==0)
++	{
++        // printk("mmap succ, len: %ld\n",len); 
++		(cur_node)->proc_resource->heapsize += (len)/(1024*1024); 
++        // int quota = quota_check(cur_node,cur_node->proc_resource,cur_pid); 
++        if(quota_check(cur_node,cur_node->proc_resource,cur_pid)==0)
++            {
++                mutex_unlock(&sentinal_lock); 
++                return 0;
++            }
++        mutex_unlock(&sentinal_lock); 
++        return -EINVAL; 
++	}
++    mutex_unlock(&sentinal_lock); 
++    return monitor; 
++}
++// int monitor_vm_munmap(unsigned long len)
++// {
++//     pid_t cur_pid = task_pid_vnr(current); 
++// 	struct pid_node* cur_node =NULL; 
++// 	int monitor= check_if_monitored(&cur_node,cur_pid); 
++// 	if(monitor==0)
++// 	{
++//         printk("mmap succ, len: %ld\n",len); 
++// 		if((cur_node)->proc_resource->heapsize >= len/(1024*1024))
++// 		    (cur_node)->proc_resource->heapsize -= len/(1024*1024); 
++//         else
++//             cur_node->proc_resource->heapsize = 0 ; 
++        
++//         return 0; 
++// 	}
++//     return monitor; 
++// }
++int monitor_files(int open)
++{
++    pid_t cur_pid = task_pid_vnr(current); 
++    pid_t cur_tgid = current->tgid ; 
++	struct pid_node* cur_node =NULL; 
++    struct pid_node* cur_node_tgid = NULL ; 
++    int monitor = -EINVAL; 
++    int monitor_tgid= -EINVAL; 
++    mutex_lock(&sentinal_lock); 
++	monitor= check_if_monitored(&cur_node,cur_pid); 
++    monitor_tgid = check_if_monitored(&cur_node_tgid,cur_tgid); 
++    if(monitor_tgid ==0 && open==1)
++	{
++		(cur_node_tgid)->proc_resource->openfile_count+= 1; 
++        // int quota = quota_check(cur_node,cur_node->proc_resource,cur_pid); 
++        if(quota_check(cur_node_tgid,cur_node_tgid->proc_resource,cur_tgid)==0 && cur_tgid==cur_pid)
++            {
++                mutex_unlock(&sentinal_lock); 
++                return 0;
++            }
++        if(cur_tgid==cur_pid)
++        {
++        mutex_unlock(&sentinal_lock); 
++        return -EINVAL ; 
++        }
++	} 
++    if(monitor_tgid==0 && open==0)
++    {
++        if(cur_node_tgid->proc_resource->openfile_count > 0)
++            (cur_node_tgid)->proc_resource->openfile_count-=1; 
++        if(cur_pid == cur_tgid)
++        {
++        mutex_unlock(&sentinal_lock) ; 
++        return 0 ; 
++        }
++    }
++	if(monitor==0 && open==1)
++	{
++		(cur_node)->proc_resource->openfile_count+= 1; 
++        // int quota = quota_check(cur_node,cur_node->proc_resource,cur_pid); 
++        if(quota_check(cur_node,cur_node->proc_resource,cur_pid)==0)
++            {
++                mutex_unlock(&sentinal_lock); 
++                return 0;
++            }
++        mutex_unlock(&sentinal_lock); 
++        return -EINVAL ; 
++	} 
++    if(monitor==0 && open==0) 
++    {
++        if(cur_node->proc_resource->openfile_count > 0)
++            (cur_node)->proc_resource->openfile_count-=1; 
++        mutex_unlock(&sentinal_lock) ; 
++        return 0 ; 
++    }
++    mutex_unlock(&sentinal_lock); 
++    return monitor; 
++}
++SYSCALL_DEFINE1(register, pid_t, pid)
++{
++    /* 
++    • If the process's pid does not exist, return -ESRCH.
++    • If the process's pid is less than 1, return -EINVAL.
++    • If the process's pid is already in the monitored list, return -ENFILE
++    */
++    struct task_struct *cur_task; 
++    struct pid_node* iter, *tmp ; 
++    struct pid_node* new_pid_node ; 
++    struct per_proc_resource* new_per_proc_resource;  
++    if(pid < 1)
++    {
++        printk("reg, pid less than 1 %d\n",pid); 
++        return -EINVAL ; 
++    }
++    mutex_lock(&sentinal_lock); 
++    cur_task = pid_task(find_get_pid(pid), PIDTYPE_PID);
++
++    if(cur_task == NULL || !pid_alive(cur_task))
++    {
++        // printk("reg, pid not found %d\n",pid); 
++        mutex_unlock(&sentinal_lock); 
++        return -ESRCH ; 
++    }
++    list_for_each_entry_safe(iter,tmp, &sentinal_head, next_prev_list) {
++        if (iter->proc_resource->pid == pid)
++            {
++                mutex_unlock(&sentinal_lock); 
++                printk("reg, pid already registered %d\n",pid); 
++                return -ENFILE;
++            }
++    }
++    cur_task->heapquota = -1 ; 
++    cur_task->filequota = -1; 
++    new_per_proc_resource = kmalloc(sizeof(*new_per_proc_resource),GFP_KERNEL); 
++    new_per_proc_resource->heapsize = 0 ; 
++    new_per_proc_resource->openfile_count =0 ; 
++    new_per_proc_resource->pid = pid; 
++    new_pid_node = kmalloc(sizeof(*new_pid_node),GFP_KERNEL); 
++    new_pid_node->proc_resource = new_per_proc_resource; 
++    list_add_tail(&new_pid_node->next_prev_list,&sentinal_head); 
++    ll_size +=1 ; 
++    mutex_unlock(&sentinal_lock); 
++    printk("reg, pid registerd succ %d\n",pid); 
++    return 0; 
++}
++int __deregister(pid_t pid)
++{
++    /* 
++    If the process's pid does not exist in the linked list, return -ESRCH.
++    If the process's pid is less than 1, return -EINVAL 
++    */
++    bool exists = false; 
++    struct pid_node* iter ,*tmp ; 
++    if(pid < 1) 
++    {
++         printk("dereg, pid less than 1 %d\n",pid); 
++         return -EINVAL; 
++    }
++    mutex_lock(&sentinal_lock); 
++    if(ll_size ==0)
++    {
++         mutex_unlock(&sentinal_lock); 
++         return -ESRCH; 
++    }
++     list_for_each_entry_safe(iter,tmp, &sentinal_head, next_prev_list) {
++         if (iter->proc_resource->pid == pid)
++         {
++             exists=true; 
++             break ; 
++         }
++     }
++     if(!exists)
++     {
++         mutex_unlock(&sentinal_lock); 
++        //  printk("dereg, pid does not exist in linked list %d\n",pid); 
++         return -ESRCH; 
++     }
++ 
++     list_del(&iter->next_prev_list); 
++     kfree(iter->proc_resource); 
++     kfree(iter); 
++     ll_size-= 1; 
++     mutex_unlock(&sentinal_lock); 
++     printk("dereg, succ dereged %d\n",pid); 
++     return 0; 
++}
++SYSCALL_DEFINE1(deregister, pid_t, pid)
++{
++    return __deregister(pid); 
++}
++
++SYSCALL_DEFINE2(fetch,struct per_proc_resource*, stats, pid_t, pid)
++{
++        /*
++    If the system call was successful, it should return 0; otherwise, it should return -EINVAL
++    */
++    bool exists = false; 
++    struct pid_node* iter,*tmp ; 
++   if(pid < 1) 
++   {
++        printk("fetch, pid less than 1 %d\n",pid); 
++        return -EINVAL; 
++   }
++
++   mutex_lock(&sentinal_lock); 
++ 
++    list_for_each_entry_safe(iter, tmp,&sentinal_head, next_prev_list) {
++        if (iter->proc_resource->pid == pid)
++        {
++            exists=true; 
++            break ; 
++        }
++    }
++    if(!exists)
++    {
++        mutex_unlock(&sentinal_lock); 
++        printk("fetch, pid does not exist in linked list %d\n",pid); 
++        return -EINVAL; 
++    }
++    
++    if(copy_to_user(stats,iter->proc_resource,sizeof(struct per_proc_resource))==0)
++    {
++        mutex_unlock(&sentinal_lock); 
++        printk("fetch, succ fetched stats of %d\n",pid); 
++        return 0 ; 
++    }
++
++    mutex_unlock(&sentinal_lock); 
++    printk("fetch, not succed %d\n",pid); 
++    return -EINVAL; 
++}
++
++SYSCALL_DEFINE3(resource_cap, pid_t, pid, long, heap_quota, long, file_quota)
++{
++    /*
++    If the values of heap quota and file quota are set to -1, then we do not have
++    any limits. 
++    If the process's pid does not exist in the system, return -ESRCH.
++    • If the process's pid does not exist in the monitored processes list,
++    return -EINVAL.
++    • If the quotas are already defined for the process, return -ENFILE
++    */
++    struct task_struct *cur_task ; 
++    struct pid_node* iter,*tmp ; 
++    bool exists = false; 
++    if(pid < 1)
++    {
++        printk("sys_res_cap, pid less than 1 so doesnt exists %d\n",pid); 
++        return -ESRCH; 
++    }
++    mutex_lock(&sentinal_lock); 
++    cur_task = pid_task(find_get_pid(pid), PIDTYPE_PID);
++    if(cur_task == NULL || !pid_alive(cur_task))
++    {
++        // printk("sys_res_cap, pid not found in system %d\n",pid); 
++        mutex_unlock(&sentinal_lock); 
++        return -ESRCH ; 
++    }
++        list_for_each_entry_safe(iter,tmp, &sentinal_head, next_prev_list) {
++            if (iter->proc_resource->pid == pid)
++            {
++                exists=true; 
++                break ; 
++            }
++        }
++    if(!exists)
++    {
++        mutex_unlock(&sentinal_lock); 
++        printk("sys_res_cap, pid does not exist in linked list %d\n",pid); 
++        return -EINVAL; 
++    }
++    if(cur_task->heapquota!=-1 || cur_task->filequota!=-1)
++    {
++        mutex_unlock(&sentinal_lock); 
++        printk("sys_res_cap, pid quotas already assigned %d\n",pid);
++        return -ENFILE; 
++    }
++    cur_task->heapquota = heap_quota; 
++    cur_task->filequota = file_quota; 
++    
++    if(iter->proc_resource->heapsize > heap_quota || iter->proc_resource->openfile_count > file_quota)
++    {
++        kill_and_dereg(iter,cur_task);  
++        mutex_unlock(&sentinal_lock); 
++        printk("set_res_cap, killing process as already more memory than quota %d\n",pid); 
++        return -EINVAL; 
++    }
++    mutex_unlock(&sentinal_lock); 
++    return 0 ; 
++}
++
++SYSCALL_DEFINE1(resource_reset, pid_t, pid)
++{
++    /*
++        If the process’s pid does not exist in the system, return -ESRCH.
++        If the process’s pid does not exist in the monitored list, return -EINVAL.
++    */
++    struct task_struct *cur_task; 
++    struct pid_node* iter,*tmp ; 
++    bool exists = false; 
++    if(pid < 1)
++    {
++        printk("sys_res_reset, pid less than 1 so doesnt exists %d\n",pid); 
++        return -ESRCH; 
++    }
++    mutex_lock(&sentinal_lock); 
++    cur_task = pid_task(find_get_pid(pid), PIDTYPE_PID);
++    if(cur_task == NULL || !pid_alive(cur_task))
++    {
++        mutex_unlock(&sentinal_lock); 
++        printk("sys_res_reset, pid not found in system %d\n",pid); 
++        return -ESRCH ; 
++    }
++        list_for_each_entry_safe(iter,tmp, &sentinal_head, next_prev_list) {
++            if (iter->proc_resource->pid == pid)
++            {
++                exists=true; 
++                break ; 
++            }
++        }
++    if(!exists)
++    {
++        mutex_unlock(&sentinal_lock); 
++        printk("sys_res_reset, pid does not exist in linked list %d\n",pid); 
++        return -EINVAL; 
++    }
++    cur_task->heapquota = -1 ; 
++    cur_task->filequota = -1 ; 
++    mutex_unlock(&sentinal_lock); 
++    return 0; 
++}
+\ No newline at end of file
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 54abd46e6..d1e636b2d 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -56,7 +56,7 @@
+ #include <trace/events/mmap.h>
+ 
+ #include "internal.h"
+-
++#include <linux/tracker_limiter.h> 
+ #ifndef arch_mmap_check
+ #define arch_mmap_check(addr, len, flags)	(0)
+ #endif
+@@ -273,6 +273,7 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ 	userfaultfd_unmap_complete(mm, &uf);
+ 	if (populate)
+ 		mm_populate(oldbrk, newbrk - oldbrk);
++	monitor_brk(oldbrk,newbrk); 
+ 	return brk;
+ 
+ out:
+@@ -1413,6 +1414,11 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 	    ((vm_flags & VM_LOCKED) ||
+ 	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
+ 		*populate = len;
++	if((flags&MAP_ANONYMOUS)&& (flags&MAP_PRIVATE))
++		monitor_mmap(len);
++		// { 
++		// 	printk("I was called\n"); 
++		// 	printk("I was called by %d\n",current->tgid); 
+ 	return addr;
+ }
+ 
